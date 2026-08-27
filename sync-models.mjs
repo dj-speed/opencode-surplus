@@ -31,6 +31,9 @@ function cacheDir() {
 function cachePath() {
   return `${cacheDir()}/models-surplus.json`
 }
+function pricingPath() {
+  return `${dataDir()}/surplus-pricing.json`
+}
 function configPath() {
   return `${configDir()}/opencode.json`
 }
@@ -90,6 +93,29 @@ async function discoverModels(baseURL = SURPLUS_INFERENCE_URL) {
   return out
 }
 
+// Best live marketplace pricing for a model (used by --pricing). Returns
+// undefined when no key/healthy offers.
+async function marketCost(model, key) {
+  if (!key) return undefined
+  try {
+    const res = await fetch(`${SURPLUS_API}/api/markets/${encodeURIComponent(model)}`, {
+      headers: { Authorization: `Bearer ${key}`, "Accept-Encoding": "identity" },
+    })
+    if (!res.ok) return undefined
+    const data = await res.json()
+    const ok = (data.offers ?? []).filter((o) => o.available && o.healthy && o.price_output_per_1m > 0)
+    if (!ok.length) return undefined
+    const best = ok.reduce((a, b) => (b.price_input_per_1m < a.price_input_per_1m ? b : a))
+    return {
+      input: best.price_input_per_1m / 1e6,
+      output: best.price_output_per_1m / 1e6,
+      cache_read: best.price_input_per_1m / 1e7,
+    }
+  } catch {
+    return undefined
+  }
+}
+
 // Best live discount from the marketplace API (used only when a key is present;
 // otherwise models are listed without availability).
 async function bestDiscount(model, key) {
@@ -112,6 +138,7 @@ async function bestDiscount(model, key) {
 async function main() {
   const args = process.argv.slice(2)
   const writeConfig = args.includes("--write-config")
+  const pricing = args.includes("--pricing")
   const queryIndex = args.indexOf("--query")
   const query = queryIndex >= 0 ? args[queryIndex + 1] : undefined
 
@@ -129,6 +156,47 @@ async function main() {
 
   writeJSON(cachePath(), models)
   console.log(`Cache written: ${cachePath()}`)
+
+  if (pricing) {
+    // Seed/refresh the pricing cache so opencode reports session costs. Mirrors
+    // the plugin's background refresh: price every discovered model (under the
+    // `surplus` provider) plus any models on-disk tier providers list.
+    const providers = new Map()
+    for (const [pid, pr] of Object.entries(cfg.provider ?? {})) {
+      if (!pid.startsWith("surplus")) continue
+      for (const mid of Object.keys(pr.models ?? {})) {
+        if (!providers.has(mid)) providers.set(mid, new Set())
+        providers.get(mid).add(pid)
+      }
+    }
+    for (const mid of Object.keys(models)) {
+      if (!providers.has(mid)) providers.set(mid, new Set())
+      providers.get(mid).add("surplus")
+    }
+    const key = authKey()
+    if (!key) {
+      console.error("No surplus key in auth.json — skipping pricing fetch.")
+    } else {
+      const out = {}
+      const ids = [...providers.keys()]
+      let priced = 0
+      for (let i = 0; i < ids.length; i++) {
+        const mid = ids[i]
+        const cost = await marketCost(mid, key)
+        if (cost) {
+          for (const pid of providers.get(mid)) out[`${pid}/${mid}`] = cost
+          priced++
+        }
+        if (i % 25 === 0) console.log(`  priced ${i}/${ids.length} ...`)
+      }
+      if (Object.keys(out).length) {
+        writeJSON(pricingPath(), out)
+        console.log(`Pricing written (${priced} models): ${pricingPath()}`)
+      } else {
+        console.log("No pricing fetched.")
+      }
+    }
+  }
 
   if (query) {
     const key = authKey()

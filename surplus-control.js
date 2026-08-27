@@ -71,7 +71,7 @@
 import { tool } from "@opencode-ai/plugin"
 import { createServer } from "node:http"
 import { request as httpsRequest } from "node:https"
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname } from "node:path"
 
@@ -90,6 +90,10 @@ const TIERS = [95, 90, 80, 70]
 // Surplus text ("No marketplace sellers currently meet the minimum …"), and
 // the x402/402 codes seen when the proxy is down.
 const FLOOR_ERROR_RE = /minimum_discount_not_met|no marketplace sellers currently meet|meet the minimum.*(discount|off)|estimated discount|x402|402/i
+
+// Pricing cache freshness: a boot skips the per-model market refresh if the
+// cache was written within this window (bounds API calls once it's seeded).
+const PRICING_TTL_MS = 15 * 60 * 1000
 
 // EXAMPLE ONLY — not a requirement.
 // These are the author's personal routing pins: GLM models are forced to the
@@ -334,29 +338,43 @@ async function handleFloorError(event, client) {
 // Background pricing refresh (deduplicated by model)
 // ---------------------------------------------------------------------------
 
-function refreshPricingInBackground(configuredModels) {
+function refreshPricingInBackground() {
   ;(async () => {
     try {
+      // Skip if a fresh run wrote pricing within the TTL — bounds API calls on
+      // every boot once the cache is seeded.
+      const p = `${process.env.XDG_DATA_HOME ?? `${homedir()}/.local/share`}/opencode/surplus-pricing.json`
+      try {
+        if (existsSync(p) && Date.now() - statSync(p).mtimeMs < PRICING_TTL_MS) return
+      } catch {}
+
+      // Model -> providers that list it: disk config (tier providers + the
+      // surplus stub) plus every discovered catalog model (merged into the
+      // `surplus` provider by the config hook).
+      const providers = new Map()
       let cfg
       try {
         cfg = JSON.parse(
           readFileSync(`${process.env.XDG_CONFIG_HOME ?? `${homedir()}/.config`}/opencode/opencode.json`, "utf8")
         )
       } catch {
-        return
+        cfg = {}
       }
-      const byMid = new Map() // modelID -> providerIDs that list it
-      for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
+      for (const [pid, pr] of Object.entries(cfg.provider ?? {})) {
         if (!pid.startsWith("surplus")) continue
-        for (const mid of Object.keys(p.models ?? {})) {
-          if (!byMid.has(mid)) byMid.set(mid, [])
-          byMid.get(mid).push(pid)
+        for (const mid of Object.keys(pr.models ?? {})) {
+          if (!providers.has(mid)) providers.set(mid, new Set())
+          providers.get(mid).add(pid)
         }
       }
+      for (const mid of Object.keys(loadModelsCache())) {
+        if (!providers.has(mid)) providers.set(mid, new Set())
+        providers.get(mid).add("surplus")
+      }
+
       const out = {}
       await Promise.all(
-        [...byMid.keys()].map(async (mid) => {
-          if (configuredModels && configuredModels.size > 0 && !configuredModels.has(mid)) return
+        [...providers.keys()].map(async (mid) => {
           try {
             const ok = ((await markets(mid)).offers ?? []).filter(
               (o) => o.available && o.healthy && o.price_output_per_1m > 0
@@ -368,12 +386,11 @@ function refreshPricingInBackground(configuredModels) {
               output: best.price_output_per_1m / 1e6,
               cache_read: best.price_input_per_1m / 1e7,
             }
-            for (const pid of byMid.get(mid)) out[`${pid}/${mid}`] = cost
+            for (const pid of providers.get(mid)) out[`${pid}/${mid}`] = cost
           } catch {}
         })
       )
       if (Object.keys(out).length) {
-        const p = `${process.env.XDG_DATA_HOME ?? `${homedir()}/.local/share`}/opencode/surplus-pricing.json`
         const tmp = `${p}.tmp`
         writeFileSync(tmp, JSON.stringify(out, null, 2) + "\n")
         renameSync(tmp, p)
@@ -502,38 +519,6 @@ export const SurplusControlPlugin = async ({ client }) => {
       }
     },
     config: (cfg) => {
-      // Which models did the user explicitly configure (before we merge the
-      // discovery cache and auto-create tier providers)? Only these get live
-      // pricing refreshes, keeping boot light.
-      const configuredModels = new Set()
-      for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
-        if (pid.startsWith("surplus")) for (const mid of Object.keys(p.models ?? {})) configuredModels.add(mid)
-      }
-
-      let cache
-      try {
-        cache = JSON.parse(
-          readFileSync(`${process.env.XDG_DATA_HOME ?? `${homedir()}/.local/share`}/opencode/surplus-pricing.json`, "utf8")
-        )
-      } catch {}
-      if (cache) {
-        for (const [key, cost] of Object.entries(cache)) {
-          const [pid, ...rest] = key.split("/")
-          const model = cfg.provider?.[pid]?.models?.[rest.join("/")]
-          if (model) model.cost = { ...(model.cost ?? {}), ...cost }
-        }
-        // Provider IDs can change when a model is moved between discount tiers.
-        // Reuse a cached model price until the next background refresh completes.
-        const byModel = {}
-        for (const [key, cost] of Object.entries(cache)) byModel[key.slice(key.indexOf("/") + 1)] = cost
-        for (const [pid, provider] of Object.entries(cfg.provider ?? {})) {
-          if (!pid.startsWith("surplus")) continue
-          for (const [mid, model] of Object.entries(provider.models ?? {})) {
-            if (!model.cost && byModel[mid]) model.cost = byModel[mid]
-          }
-        }
-      }
-
       // ---- Catalog provider (single, no duplicates) ----------------------
       // All discovered models live in ONE `surplus` provider so the model
       // picker lists each model exactly once. The provider sets NO baseURL:
@@ -584,6 +569,34 @@ export const SurplusControlPlugin = async ({ client }) => {
         }
       }
 
+      // ---- Apply cached marketplace pricing -----------------------------
+      // Costs come from the background pricing refresh (surplus-pricing.json).
+      // Applied AFTER the catalog merge so the discovered `surplus` provider
+      // models get priced too — otherwise opencode reports $0 session cost.
+      let cache
+      try {
+        cache = JSON.parse(
+          readFileSync(`${process.env.XDG_DATA_HOME ?? `${homedir()}/.local/share`}/opencode/surplus-pricing.json`, "utf8")
+        )
+      } catch {}
+      if (cache) {
+        for (const [key, cost] of Object.entries(cache)) {
+          const [pid, ...rest] = key.split("/")
+          const model = cfg.provider?.[pid]?.models?.[rest.join("/")]
+          if (model) model.cost = { ...(model.cost ?? {}), ...cost }
+        }
+        // Provider IDs can change when a model is moved between discount tiers.
+        // Reuse a cached model price until the next background refresh completes.
+        const byModel = {}
+        for (const [key, cost] of Object.entries(cache)) byModel[key.slice(key.indexOf("/") + 1)] = cost
+        for (const [pid, provider] of Object.entries(cfg.provider ?? {})) {
+          if (!pid.startsWith("surplus")) continue
+          for (const [mid, model] of Object.entries(provider.models ?? {})) {
+            if (!model.cost && byModel[mid]) model.cost = byModel[mid]
+          }
+        }
+      }
+
       // ---- Model discovery ----------------------------------------------
       // Phase 2 (async, background): refresh the catalog + cache for next boot.
       ;(async () => {
@@ -593,8 +606,8 @@ export const SurplusControlPlugin = async ({ client }) => {
         } catch {}
       })()
 
-      // ---- Pricing refresh (bounded to configured models) ---------------
-      refreshPricingInBackground(configuredModels)
+      // ---- Pricing refresh (background, deduplicated by model) ----------
+      refreshPricingInBackground()
     },
 
     "chat.params": async (input, output) => {
