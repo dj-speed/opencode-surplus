@@ -86,7 +86,9 @@ type Listener = () => void
 type TpsTiers = { slow: number; normal: number; fast: number }
 type TtftTiers = { fast: number; ok: number }
 type SpinnerCfg = { colors: RGBA[]; intervalMs: number; enabled: boolean; cells: number }
-type ResolvedConfig = { spinner: SpinnerCfg; tps: TpsTiers; ttft: TtftTiers }
+type ResolvedConfig = { enabled: boolean; filterByPin: boolean; spinner: SpinnerCfg; tps: TpsTiers; ttft: TtftTiers }
+
+const TIERS = [95, 90, 80, 70] as const
 
 type Offer = { provider: string; price: number; discount: number }
 type Usage = { cost: number; tokens: number; avgPer1M: number; direct?: number; discountPct?: number; cacheRead?: number; in?: number; out?: number; input?: number }
@@ -107,6 +109,7 @@ type SpendState = {
   providerID?: string
   limit?: number
   pin?: string
+  floor?: number
   loadingModel?: string
 }
 
@@ -158,7 +161,7 @@ async function actualTodayUsage(): Promise<Usage | undefined> {
   const tomorrow = new Date(now.getTime() + 86400000).toISOString().slice(0, 10)
   const response = await fetch(
     `https://api.surplusintelligence.ai/v1/buyer/usage/export?format=csv&from=${from}&to=${tomorrow}`,
-    { headers: { Authorization: `Bearer ${key}` } },
+    { headers: { Authorization: `Bearer ${key}`, "Accept-Encoding": "identity" } },
   )
   if (!response.ok) return undefined
   const lines = (await response.text()).trim().split(/\r?\n/)
@@ -220,15 +223,17 @@ function readSurplusOverrides() {
 // actual input:output mix (from today's settled usage) and their actual cache-hit
 // fraction (from the session). The offers API exposes no cache price, so the
 // standard 10% cache-read rate is applied to the user's cached share of input.
-async function currentOffers(model: string, wIn = 0.75, cacheFrac = 0) {
+// When `filterByPin` is set, only offers matching the model's routing pin are kept.
+async function currentOffers(model: string, wIn = 0.75, cacheFrac = 0, filterByPin = false, pin?: string) {
   const key = surplusKey()
   if (!key) return { offers: [] }
   const response = await fetch(`https://api.surplusintelligence.ai/api/markets/${encodeURIComponent(model)}`, {
-    headers: { Authorization: `Bearer ${key}` },
+    headers: { Authorization: `Bearer ${key}`, "Accept-Encoding": "identity" },
   })
   if (!response.ok) return { offers: [] }
   const data = await response.json()
-  const all = (data.offers ?? []).filter((o: any) => o.available && o.healthy && o.direct_input_per_1m > 0 && o.direct_output_per_1m > 0)
+  let all = (data.offers ?? []).filter((o: any) => o.available && o.healthy && o.direct_input_per_1m > 0 && o.direct_output_per_1m > 0)
+  if (filterByPin && pin) all = filterOffersByPin(all, pin)
   const wOut = 1 - wIn
   const cacheAdj = 1 - 0.9 * Math.min(Math.max(cacheFrac, 0), 0.95)
   const offers = all
@@ -246,6 +251,32 @@ async function currentOffers(model: string, wIn = 0.75, cacheFrac = 0) {
     .sort((a: any, b: any) => a.price - b.price)
     .slice(0, 3)
   return { offers }
+}
+
+// Keep only offers for a pinned seller. A pin is either a host URL
+// (https://host/v1 -> hostname match on seller_base_url) or a provider family
+// name (e.g. "zai-coding" -> provider/URL substring match).
+function filterOffersByPin(offers: any[], pin: string | undefined) {
+  if (!pin) return offers
+  const isURL = /^https?:\/\//.test(pin)
+  const host = isURL ? new URL(pin).hostname : undefined
+  return offers.filter((o) => {
+    if (isURL) {
+      try {
+        return new URL(o.seller_base_url).hostname === host
+      } catch {
+        return false
+      }
+    }
+    const prov = String(o.provider ?? "").toLowerCase()
+    const url = String(o.seller_base_url ?? "").toLowerCase()
+    return prov.includes(pin.toLowerCase()) || url.includes(pin.toLowerCase())
+  })
+}
+
+function activePinFor(model: string): string | undefined {
+  const overrides = readSurplusOverrides()[model]
+  return overrides?.pin !== undefined ? overrides.pin : BASE_PINS[model]
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +326,7 @@ function TodayBlock(props: { api: Parameters<TuiPlugin>[0]; spend: SpendState; s
   )
 }
 
-function SpendDisplay(props: { api: Parameters<TuiPlugin>[0]; sessionID: string; spend: SpendState; subscribe: (listener: Listener) => () => void }) {
+function SpendDisplay(props: { api: Parameters<TuiPlugin>[0]; sessionID: string; spend: SpendState; config: ResolvedConfig; subscribe: (listener: Listener) => () => void }) {
   let floorRef: TextRenderable | undefined
   let offerPctRefs: (TextRenderable | undefined)[] = []
   let offerPriceRefs: (TextRenderable | undefined)[] = []
@@ -314,28 +345,33 @@ function SpendDisplay(props: { api: Parameters<TuiPlugin>[0]; sessionID: string;
       : undefined
     const model = stored ?? fallback
     const providerID = model?.providerID
-    const modelID = providerID?.startsWith("surplus") ? model.id : undefined
+    const modelID = providerID?.startsWith("surplus") ? normalizeModelID(model.id) : undefined
     if (!modelID) {
       props.spend.model = undefined
       props.spend.providerID = undefined
       props.spend.offers = []
       props.spend.limit = undefined
       props.spend.pin = undefined
+      props.spend.floor = undefined
       return
     }
+    const overrides = readSurplusOverrides()[modelID] ?? {}
+    const pin = overrides.pin !== undefined ? overrides.pin : BASE_PINS[modelID]
+    const floor = overrides.floor !== undefined ? overrides.floor : tierFloor(providerID)
+    // Refresh pin/floor on every pass so /surplus-tier + /surplus-pin changes
+    // show immediately; the guards below only short-circuit the offers fetch.
+    props.spend.pin = pin
+    props.spend.floor = floor
     if (props.spend.loadingModel === modelID) return
     if (props.spend.model === modelID && props.spend.providerID === providerID) return
     props.spend.model = modelID
     props.spend.providerID = providerID
     props.spend.offers = []
     props.spend.limit = undefined
-    props.spend.pin = undefined
     props.spend.loadingModel = modelID
-    const overrides = readSurplusOverrides()[modelID] ?? {}
-    props.spend.pin = overrides.pin ?? BASE_PINS[modelID]
     try {
       const bw = blendWeights(props.spend, props.api, props.sessionID)
-      const result = await currentOffers(modelID, bw.wIn, bw.cacheFrac)
+      const result = await currentOffers(modelID, bw.wIn, bw.cacheFrac, props.config.filterByPin, pin)
       props.spend.offers = result.offers
       if (overrides.maxPrice != null) props.spend.limit = overrides.maxPrice
     } catch {}
@@ -346,9 +382,8 @@ function SpendDisplay(props: { api: Parameters<TuiPlugin>[0]; sessionID: string;
     const theme = props.api.theme.current
     void loadModel()
     const surplus = props.spend.model !== undefined
-    const tierMatch = props.spend.providerID?.match(/surplus-(\d+)/)
-    const tier = tierMatch ? Number(tierMatch[1]) : undefined
-    if (floorRef) { floorRef.content = surplus ? (tier !== undefined ? `≥${tier}% (min${tier})` : "--") : ""; floorRef.fg = surplus ? theme.accent : theme.textMuted }
+    const floor = props.spend.floor
+    if (floorRef) { floorRef.content = surplus ? (floor !== undefined && floor > 0 ? `≥${floor}% (min${floor})` : "--") : ""; floorRef.fg = surplus ? theme.accent : theme.textMuted }
     for (let i = 0; i < offerPctRefs.length; i++) {
       const offer = props.spend.offers[i]
       if (offerPctRefs[i]) {
@@ -402,6 +437,8 @@ const THEME_PRESETS: Record<string, string[]> = {
 
 function resolveConfig(options: PluginOptions | undefined): ResolvedConfig {
   const o = (options ?? {}) as {
+    enabled?: boolean
+    offers?: { filterByPin?: boolean }
     spinner?: { theme?: string; colors?: string[]; intervalMs?: number; enabled?: boolean; cells?: number }
     tiers?: { tps?: Partial<TpsTiers>; ttft?: Partial<TtftTiers> }
   }
@@ -424,6 +461,8 @@ function resolveConfig(options: PluginOptions | undefined): ResolvedConfig {
   const tp = tiers.tps ?? {}
   const tt = tiers.ttft ?? {}
   return {
+    enabled: o.enabled !== false,
+    filterByPin: o.offers?.filterByPin ?? false,
     spinner,
     tps: { slow: tp.slow ?? 20, normal: tp.normal ?? 50, fast: tp.fast ?? 100 },
     ttft: { fast: tt.fast ?? 10000, ok: tt.ok ?? 20000 },
@@ -618,18 +657,37 @@ function writeSurplusOverrides(state: Record<string, unknown>) {
   writeFileSync(overridesPath(), JSON.stringify(state, null, 2) + "\n")
 }
 
+function modelsCachePath() {
+  return `${process.env.XDG_CACHE_HOME ?? `${homedir()}/.cache`}/opencode/models-surplus.json`
+}
+
+function readModelsCache() {
+  try {
+    return JSON.parse(readFileSync(modelsCachePath(), "utf8"))
+  } catch {
+    return {}
+  }
+}
+
+// A model id may come back prefixed with its provider ("surplus/glm-5.3-flash");
+// strip the prefix so TUI, server, tools, and the overrides store agree.
+function normalizeModelID(id: string): string {
+  const slash = id.indexOf("/")
+  return slash > 0 ? id.slice(slash + 1) : id
+}
+
 function activeModel(api: TuiApi): { sessionID: string; model: string; providerID: string } | undefined {
   const route = api.route.current
   const sessionID = route.name === "session" ? route.params?.sessionID : undefined
   if (!sessionID) return undefined
   const session = api.state.session.get(sessionID)
   const model = session?.model
-  if (model?.providerID?.startsWith("surplus")) return { sessionID, model: model.id, providerID: model.providerID }
+  if (model?.providerID?.startsWith("surplus")) return { sessionID, model: normalizeModelID(model.id), providerID: model.providerID }
   const messages = api.state.session.messages(sessionID)
   const latest = [...messages].reverse().find((m) => m.role === "assistant" || m.role === "user")
   if (!latest) return { sessionID, model: "", providerID: "" }
-  if (latest.role === "assistant") return { sessionID, model: latest.modelID, providerID: latest.providerID }
-  return { sessionID, model: latest.model.modelID, providerID: latest.model.providerID }
+  if (latest.role === "assistant") return { sessionID, model: normalizeModelID(latest.modelID), providerID: latest.providerID }
+  return { sessionID, model: normalizeModelID(latest.model.modelID), providerID: latest.model.providerID }
 }
 
 function sessionUsage(api: TuiApi, sessionID: string): Usage {
@@ -671,16 +729,17 @@ function blendWeights(spend: SpendState, api: TuiApi, sessionID: string): { wIn:
   return { wIn, cacheFrac }
 }
 
-async function allOffers(model: string): Promise<{ provider: string; host: string; inputUsd: number; discount: number }[]> {
+async function allOffers(model: string, filterByPin = false, pin?: string): Promise<{ provider: string; host: string; inputUsd: number; discount: number }[]> {
   const key = surplusKey()
   if (!key) return []
   const res = await fetch(`https://api.surplusintelligence.ai/api/markets/${encodeURIComponent(model)}`, {
-    headers: { Authorization: `Bearer ${key}` },
+    headers: { Authorization: `Bearer ${key}`, "Accept-Encoding": "identity" },
   })
   if (!res.ok) return []
   const data = await res.json()
-  return (data.offers ?? [])
-    .filter((o: any) => o.available && o.healthy && o.direct_input_per_1m > 0)
+  let rows = (data.offers ?? []).filter((o: any) => o.available && o.healthy && o.direct_input_per_1m > 0)
+  if (filterByPin && pin) rows = filterOffersByPin(rows, pin)
+  return rows
     .map((o: any) => ({
       provider: o.provider,
       host: o.seller_base_url,
@@ -691,12 +750,45 @@ async function allOffers(model: string): Promise<{ provider: string; host: strin
 }
 
 // ---------------------------------------------------------------------------
+// Tier helpers.
+// ---------------------------------------------------------------------------
+
+function tierFloor(providerID: string | undefined): number | undefined {
+  const m = providerID?.match(/^surplus-(\d+)$/)
+  return m ? Number(m[1]) : undefined
+}
+
+function lastUserText(api: TuiApi, sessionID: string): string | undefined {
+  const messages = api.state.session.messages(sessionID)
+  const lastUser = [...messages].reverse().find((m) => m.role === "user")
+  if (!lastUser) return undefined
+  const text = lastUser.parts.filter((p) => p.type === "text").map((p) => p.text).join("\n")
+  return text.trim() || undefined
+}
+
+// Re-submit the last user message. The floor proxy applies the model's current
+// floor on the next request, so after adjusting the floor this is a real retry.
+async function retryLastUserMessage(api: TuiApi, sessionID: string) {
+  const text = lastUserText(api, sessionID)
+  if (!text) return false
+  try {
+    await api.client.session.prompt({
+      path: { id: sessionID },
+      body: { parts: [{ type: "text", text }] },
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
 // /surplus-* TUI commands. Registered in-process via api.command — they fetch
 // live data and show a dialog, with NO model/LLM round-trip, so they're
 // instant and free. They appear in both the "/" autocomplete and the Ctrl-P
 // command palette under the "Surplus" category.
 // ---------------------------------------------------------------------------
-function registerSurplusCommands(api: TuiApi): () => void {
+function registerSurplusCommands(api: TuiApi, config: ResolvedConfig, bump: () => void): () => void {
   const show = (title: string, lines: string[], variant: "info" | "success" | "warning" | "error" = "info") => {
     api.ui.dialog.replace(() => (
       <api.ui.DialogAlert
@@ -716,6 +808,7 @@ function registerSurplusCommands(api: TuiApi): () => void {
     const overrides = readSurplusOverrides()
     overrides[model] = { ...overrides[model], pin }
     writeSurplusOverrides(overrides)
+    bump()
   }
 
   const pinAlert = (model: string, pin: string | null) => {
@@ -794,12 +887,14 @@ function registerSurplusCommands(api: TuiApi): () => void {
         const m = current()
         if (!m.model) { show("Surplus status", ["No active session/model.", "Open a session first."], "warning"); return }
         const overrides = readSurplusOverrides()[m.model] ?? {}
+        const floor = overrides.floor !== undefined ? overrides.floor : tierFloor(m.providerID)
         const offers = await allOffers(m.model)
         const best = offers[0]
         const session = m.sessionID ? sessionUsage(api, m.sessionID) : { cost: 0, tokens: 0, avgPer1M: 0 }
         const lines = [
           `Model:   ${m.model}`,
-          `Provider:${m.providerID} (floor min${m.providerID.replace("surplus-", "")})`,
+          `Provider:${m.providerID}`,
+          `Floor:   ${floor !== undefined ? `≥${floor}% (min${floor})` : "off"}`,
           `Pin:     ${overrides.pin ?? BASE_PINS[m.model] ?? "none"}`,
           `Overrides:${Object.keys(overrides).length ? JSON.stringify(overrides) : "none"}`,
         ]
@@ -807,7 +902,7 @@ function registerSurplusCommands(api: TuiApi): () => void {
           lines.push(`Session: $${session.cost.toFixed(4)} · avg $${session.avgPer1M.toFixed(3)}/1M · ${fmtTokens(session.tokens)} tok`)
         }
         if (best) {
-          const passing = [95, 90, 80, 70].find((t) => best.discount >= t) ?? 0
+          const passing = TIERS.find((t) => best.discount >= t) ?? 0
           lines.push(`Best:    ${best.discount}% off (${best.provider}, $${best.inputUsd}/1M in)`)
           lines.push(passing ? `Strictest passing provider: surplus-${passing}` : "No tier provider currently passes.")
         } else {
@@ -825,12 +920,14 @@ function registerSurplusCommands(api: TuiApi): () => void {
       onSelect: async () => {
         const m = current()
         if (!m.model) { show("Surplus offers", ["No active session/model.", "Open a session first."], "warning"); return }
-        const offers = await allOffers(m.model)
+        const pin = activePinFor(m.model)
+        const offers = await allOffers(m.model, config.filterByPin, pin)
         if (!offers.length) { show("Surplus offers", [`No healthy offers for ${m.model} right now.`], "warning"); return }
         const best = offers[0]
-        const passing = [95, 90, 80, 70].find((t) => best.discount >= t) ?? 0
+        const passing = TIERS.find((t) => best.discount >= t) ?? 0
+        const filtered = config.filterByPin && pin ? " (filtered to pin)" : ""
         const lines = [
-          `Healthy offers for ${m.model} (best ${best.discount}% off):`,
+          `Healthy offers for ${m.model}${filtered} (best ${best.discount}% off):`,
           ...offers.slice(0, 10).map((o, i) => `${i + 1}. ${o.provider} ${o.host} — $${o.inputUsd.toFixed(4)}/1M in (~${o.discount}% off)`),
           passing ? `\nStrictest provider that passes: surplus-${passing}` : "\nNo tier provider currently passes.",
         ]
@@ -840,20 +937,45 @@ function registerSurplusCommands(api: TuiApi): () => void {
     {
       title: "Surplus tier",
       value: "surplus.tier",
-      description: "Strictest discount tier provider that currently passes",
+      description: "Set the discount floor for the active model (≥70/80/90/95% or off)",
       category: "Surplus",
       slash: { name: "surplus-tier" },
       onSelect: async () => {
         const m = current()
         if (!m.model) { show("Surplus tier", ["No active session/model.", "Open a session first."], "warning"); return }
-        const offers = await allOffers(m.model)
-        if (!offers.length) { show("Surplus tier", [`No healthy offers for ${m.model} right now.`], "warning"); return }
-        const best = offers[0]
-        const passing = [95, 90, 80, 70].find((t) => best.discount >= t) ?? 0
-        show("Surplus tier", [
-          `Best offer for ${m.model}: ${best.discount}% off (${best.provider}).`,
-          passing ? `Select provider surplus-${passing} to enforce ≥${passing}% (min${passing} URL).` : "No tier provider currently passes.",
-        ])
+        const overrides = readSurplusOverrides()[m.model] ?? {}
+        const currentFloor = overrides.floor !== undefined ? overrides.floor : tierFloor(m.providerID)
+        const applyFloor = async (tier: number) => {
+          const all = readSurplusOverrides()
+          all[m.model] = { ...all[m.model], floor: tier }
+          writeSurplusOverrides(all)
+          bump()
+          show("Surplus tier", [
+            tier === 0 ? `Floor for ${m.model}: off (no minimum discount).` : `Floor for ${m.model}: ≥${tier}% off.`,
+            "Applies to the next request (the floor proxy routes via the /min{N} URL).",
+          ], "success")
+        }
+        api.ui.dialog.replace(() => (
+          <api.ui.DialogSelect
+            title={`Discount floor for ${m.model}`}
+            placeholder="Select a floor…"
+            options={[
+              {
+                title: "Off (no minimum)",
+                value: 0,
+                description: "route through the neutral surplus provider",
+                onSelect: () => { void applyFloor(0) },
+              },
+              ...TIERS.map((t) => ({
+                title: `≥${t}% off (min${t})`,
+                value: t,
+                description: `surplus-${t} provider`,
+                onSelect: () => { void applyFloor(t) },
+              })),
+            ]}
+            current={currentFloor}
+          />
+        ))
       },
     },
     {
@@ -907,7 +1029,81 @@ function registerSurplusCommands(api: TuiApi): () => void {
         }
         delete overrides[m.model]
         writeSurplusOverrides(overrides)
+        bump()
         show("Surplus clear", `Cleared overrides for ${m.model}.`, "success")
+      },
+    },
+    {
+      title: "Surplus flag",
+      value: "surplus.flag",
+      description: "Toggle backoff-prompt mode (immediate adjust dialog on floor failure vs normal fail)",
+      category: "Surplus",
+      slash: { name: "surplus-flag" },
+      onSelect: () => {
+        const on = readSurplusOverrides()._flags?.backoffPrompt ?? false
+        const setFlag = (v: boolean) => {
+          const st = readSurplusOverrides()
+          st._flags = { ...(st._flags ?? {}), backoffPrompt: v }
+          writeSurplusOverrides(st)
+          bump()
+          show("Surplus flag", [`Backoff-prompt mode: ${v ? "ON (immediately prompts to adjust the discount tier on a floor failure)" : "OFF (floor failures fail normally, no prompt)"}.`], "success")
+        }
+        api.ui.dialog.replace(() => (
+          <api.ui.DialogSelect
+            title="Surplus backoff-prompt mode"
+            placeholder="Select…"
+            options={[
+              { title: "ON — prompt to adjust the discount tier on failure", value: true, onSelect: () => setFlag(true) },
+              { title: "OFF — normal failure message, no prompt", value: false, onSelect: () => setFlag(false) },
+            ]}
+            current={on}
+          />
+        ))
+      },
+    },
+    {
+      title: "Surplus models",
+      value: "surplus.models",
+      description: "List discovered Surplus models (from the local catalog cache)",
+      category: "Surplus",
+      slash: { name: "surplus-models" },
+      onSelect: async () => {
+        const models = readModelsCache()
+        const ids = Object.keys(models)
+        if (!ids.length) {
+          show("Surplus models", [
+            "No models discovered yet.",
+            "Run `node sync-models.mjs` (from this package) or restart opencode with a surplus provider to scrape the catalog.",
+          ], "info")
+          return
+        }
+        const active = current().model
+        const lines = [
+          `Discovered ${ids.length} surplus models.`,
+          ...ids.slice(0, 25).map((id) => `${id === active ? "* " : "  "}${id} (${models[id]?.name ?? id})`),
+          ids.length > 25 ? `\n… and ${ids.length - 25} more (see node sync-models.mjs --query <str>).` : "",
+        ]
+        show("Surplus models", lines)
+      },
+    },
+    {
+      title: "Surplus TUI toggle",
+      value: "surplus.tui",
+      description: "Disable the surplus TUI integration (meter, sidebar, commands) for this session",
+      category: "Surplus",
+      slash: { name: "surplus-tui" },
+      onSelect: () => {
+        api.ui.dialog.replace(() => (
+          <api.ui.DialogConfirm
+            title="Disable Surplus TUI?"
+            message="Hides the meter, sidebar blocks, and /surplus-* commands for the rest of this session. Re-enable via /plugins or the tui.json config."
+            onConfirm={async () => {
+              try { await api.plugins.deactivate("surplus-sidebar-v2") } catch {}
+              api.ui.dialog.clear()
+            }}
+            onCancel={() => api.ui.dialog.clear()}
+          />
+        ))
       },
     },
   ])
@@ -915,9 +1111,18 @@ function registerSurplusCommands(api: TuiApi): () => void {
 
 const tui: TuiPlugin = async (api, options) => {
   const config = resolveConfig(options)
+
+  // Master toggle: with `"enabled": false` in the tui.json plugin tuple, the
+  // meter, sidebar blocks, commands, and event wiring are skipped entirely.
+  if (!config.enabled) return
+
   const muted = api.theme.current.textMuted
 
-  const disposeCommands = registerSurplusCommands(api)
+  const listeners = new Set<Listener>()
+  const bump = () => { for (const l of listeners) l() }
+  const subscribe = (listener: Listener) => { listeners.add(listener); return () => { listeners.delete(listener) } }
+
+  const disposeCommands = registerSurplusCommands(api, config, bump)
 
   // -------------------------------------------------------------------------
   // Main plugin body: wires up the TPS tracker, the spend/offer refresh loops,
@@ -937,9 +1142,6 @@ const tui: TuiPlugin = async (api, options) => {
     thinkingBySession: {},
   }
   const spend: SpendState = { loading: false }
-  const listeners = new Set<Listener>()
-  const bump = () => { for (const l of listeners) l() }
-  const subscribe = (listener: Listener) => { listeners.add(listener); return () => { listeners.delete(listener) } }
 
   const refreshSpend = async () => {
     if (spend.loading) return
@@ -976,7 +1178,7 @@ const tui: TuiPlugin = async (api, options) => {
     if (!modelID || spend.model !== modelID) return
     try {
       const bw = blendWeights(spend, api, sessionID)
-      const result = await currentOffers(modelID, bw.wIn, bw.cacheFrac)
+      const result = await currentOffers(modelID, bw.wIn, bw.cacheFrac, config.filterByPin, activePinFor(modelID))
       spend.offers = result.offers
     } catch {}
     bump()
@@ -1122,6 +1324,81 @@ const tui: TuiPlugin = async (api, options) => {
     }
   })
 
+  // -------------------------------------------------------------------------
+  // Floor-failure prompt dialog (backoff-prompt mode ON). The server detects a
+  // floor failure and immediately writes `_backoffPrompt` for the active model
+  // with a recommended tier (the strictest passing tier below the current
+  // floor). We poll the store and show the dialog; picking a tier applies it
+  // and re-submits your last message through the new floor.
+  // -------------------------------------------------------------------------
+  const alert = (title: string, lines: string[]) => {
+    api.ui.dialog.replace(() => (
+      <api.ui.DialogAlert title={title} message={lines.join("\n")} onConfirm={() => api.ui.dialog.clear()} />
+    ))
+  }
+  const shownBackoff = new Set<string>()
+  const maybeShowBackoffPrompt = () => {
+    const route = api.route.current
+    const sessionID = route.name === "session" ? route.params?.sessionID : undefined
+    if (!sessionID) return
+    const sid = sessionID as unknown as string
+    const overrides = readSurplusOverrides()
+    if (!(overrides._flags?.backoffPrompt ?? false)) return
+    const m = activeModel(api)
+    if (!m?.model) return
+    const entry = (overrides._backoffPrompt ?? {})[m.model] as
+      | { at?: number; sessionID?: string; currentTier?: number | null; targetTier?: number | null } | undefined
+    if (!entry) return
+    if (Date.now() - (entry.at ?? 0) > 120000) return
+    const key = `${m.model}:${entry.at}`
+    if (shownBackoff.has(key)) return
+    shownBackoff.add(key)
+    const targetTier = entry.targetTier ?? undefined
+    const resolveBackoff = async (tier: number) => {
+      const st = readSurplusOverrides()
+      st[m.model] = { ...st[m.model], floor: tier }
+      delete (st._backoffPrompt ?? {})[m.model]
+      writeSurplusOverrides(st)
+      // Acknowledge immediately; the retry then streams in the session.
+      alert("Surplus backoff", [
+        `Floor for ${m.model}: ${tier === 0 ? "off" : `≥${tier}%`}.`,
+        "Retrying your last message through the new floor…",
+      ])
+      await retryLastUserMessage(api, sid)
+    }
+    const options: any[] = []
+    if (targetTier) {
+      options.push({
+        title: `Set floor to ≥${targetTier}% and retry`,
+        value: targetTier,
+        description: "next request routes via /min{target}",
+        onSelect: () => { void resolveBackoff(targetTier) },
+      })
+    }
+    options.push({
+      title: "Set floor to off and retry",
+      value: 0,
+      description: "no minimum discount",
+      onSelect: () => { void resolveBackoff(0) },
+    })
+    options.push({ title: "Cancel", value: null, description: "leave the floor as-is", onSelect: () => { api.ui.dialog.clear() } })
+    api.ui.dialog.replace(() => (
+      <api.ui.DialogSelect
+        title={`Discount floor ≥${entry.currentTier ?? "?"}% not met`}
+        placeholder="Adjust the tier…"
+        options={options}
+      />
+    ))
+  }
+  const backoffTimer = setInterval(maybeShowBackoffPrompt, 5000)
+  const onSessionError = api.event.on("session.error", (evt) => {
+    const err = (evt.properties as any)?.error as { data?: { message?: string }; message?: string } | undefined
+    const msg = typeof err?.data?.message === "string" ? err.data.message : (typeof err?.message === "string" ? err.message : "")
+    if (/minimum_discount_not_met|no marketplace sellers currently meet|meet the minimum.*(discount|off)|estimated discount|x402|402/i.test(msg)) {
+      setTimeout(maybeShowBackoffPrompt, 1500)
+    }
+  })
+
   const timer = setInterval(() => {
     const now = Date.now()
     const cutoff = now - WINDOW_MS
@@ -1138,9 +1415,11 @@ const tui: TuiPlugin = async (api, options) => {
     onTextDelta(); onReasoningDelta(); onPartDelta()
     onMessageUpdated(); onToolInputStarted(); onPartUpdated()
     onSpendMessageUpdated()
+    onSessionError()
     clearInterval(timer)
     clearInterval(spendTimer)
     clearInterval(offerTimer)
+    clearInterval(backoffTimer)
     if (spinnerTimer) clearInterval(spinnerTimer)
   })
 
@@ -1163,7 +1442,7 @@ const tui: TuiPlugin = async (api, options) => {
         return <TodayBlock api={api} spend={spend} subscribe={subscribe} />
       },
       sidebar_footer(_ctx, value) {
-        return <SpendDisplay api={api} sessionID={value.session_id} spend={spend} subscribe={subscribe} />
+        return <SpendDisplay api={api} sessionID={value.session_id} spend={spend} config={config} subscribe={subscribe} />
       },
     },
   })

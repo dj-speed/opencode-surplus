@@ -17,6 +17,9 @@
   "files": [
     "surplus-sidebar.tsx",
     "surplus-control.js",
+    "sync-models.mjs",
+    "BENCHMARKS.md",
+    "UAT.md",
     "README.md",
     "LICENSE"
   ],

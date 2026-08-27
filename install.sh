@@ -41,7 +41,15 @@ else
   echo "note: surplus-control.js not found; skipping server plugin"
 fi
 
-# 3. Wire the TUI plugin into tui.json (back it up first).
+# 3. Copy the optional model-sync script (manual model discovery).
+if [ -f "$SRC/sync-models.mjs" ]; then
+  cp "$SRC/sync-models.mjs" "$CONFIG_DIR/sync-models.mjs"
+  echo "installed $CONFIG_DIR/sync-models.mjs"
+else
+  echo "note: sync-models.mjs not found; skipping"
+fi
+
+# 4. Wire the TUI plugin into tui.json (back it up first).
 TUI_JSON="$CONFIG_DIR/tui.json"
 if [ -f "$TUI_JSON" ]; then
   cp "$TUI_JSON" "$TUI_JSON.bak-$(date +%Y%m%d-%H%M%S)"
