@@ -168,6 +168,8 @@ The catalog is scraped from the Surplus inference endpoint (`https://www.surplus
 ```bash
 node sync-models.mjs                # discover + cache only
 node sync-models.mjs --write-config # also write models into provider "surplus" in opencode.json
+                                    # (models already in a surplus-NN tier provider are skipped — no duplicates)
+node sync-models.mjs --pricing      # seed/refresh the pricing cache (surplus-pricing.json) for session cost
 node sync-models.mjs --query gpt    # list matching models with live discounts
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "opencode-surplus",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Surplus Intelligence status and routing controls for the opencode TUI: live TPS meter, Today spend, blended marketplace offers, session stats, and /surplus-* commands.",
   "license": "MIT",
   "type": "module",
@@ -18,8 +18,11 @@
     "surplus-sidebar.tsx",
     "surplus-control.js",
     "sync-models.mjs",
+    "install.sh",
+    "CHANGELOG.md",
     "BENCHMARKS.md",
     "UAT.md",
+    "UAT-results.md",
     "README.md",
     "LICENSE"
   ],

@@ -212,9 +212,18 @@ async function main() {
   if (writeConfig) {
     // Write the catalog into the single `surplus` provider (no base URL — each
     // model carries its own URL via `provider.api`, so floors apply per model).
+    // Mirror the runtime config-hook rule: models that already exist in a
+    // `surplus-NN` tier provider are skipped here so nothing is listed twice.
+    const elsewhere = new Set()
+    for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
+      if (pid.startsWith("surplus") && pid !== "surplus") {
+        for (const mid of Object.keys(p.models ?? {})) elsewhere.add(mid)
+      }
+    }
     const existing = cfg.provider?.surplus ?? {}
     const written = {}
     for (const [id, m] of Object.entries(models)) {
+      if (elsewhere.has(id)) continue
       written[id] = { id, name: m.name ?? id, provider: { api: `${SURPLUS_API}/v1` } }
     }
     cfg.provider = cfg.provider ?? {}
