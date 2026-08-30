@@ -754,13 +754,14 @@ function writeCalibStore(store: CalibStore) {
 // rates and the direct rates needed for a session discount. Returns undefined
 // until enough distinct pairs exist.
 function fitRates(pairs: CalibPair[], field: "cost" | "direct"): CalibRates | undefined {
-  const n = pairs.length
-  if (n < 5) return undefined
   const k = 3
   const M = Array.from({ length: k }, () => Array(k + 1).fill(0))
+  let n = 0
   for (const p of pairs) {
     const A = [p.fresh, p.cache, p.out]
     const y = p[field]
+    if (typeof y !== "number" || !Number.isFinite(y) || !A.every((v) => Number.isFinite(v))) continue
+    n++
     for (let j = 0; j < k; j++) {
       M[j][k] += A[j] * y
       for (let l = 0; l < k; l++) M[j][l] += A[j] * A[l]
@@ -776,6 +777,7 @@ function fitRates(pairs: CalibPair[], field: "cost" | "direct"): CalibRates | un
     }
   }
   const x = Array(k).fill(0)
+  if (n < 5) return undefined
   for (let i = k - 1; i >= 0; i--) {
     x[i] = M[i][k]
     for (let j = i + 1; j < k; j++) x[i] -= M[i][j] * x[j]
