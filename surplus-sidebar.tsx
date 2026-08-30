@@ -93,6 +93,9 @@ const TIERS = [95, 90, 80, 70] as const
 type Offer = { provider: string; price: number; discount: number }
 type Usage = { cost: number; tokens: number; avgPer1M: number; direct?: number; discountPct?: number; cacheRead?: number; in?: number; out?: number; input?: number }
 
+// One settled (or accrued) Surplus usage record for today's export CSV.
+type SettledRow = { at: number; model: string; inT: number; outT: number; cost: number; direct: number }
+
 type SpendState = {
   today?: number
   todayTokens?: number
@@ -153,9 +156,9 @@ function csvFields(line: string) {
   return fields
 }
 
-async function actualTodayUsage(): Promise<Usage | undefined> {
+async function fetchSettledRows(): Promise<SettledRow[]> {
   const key = surplusKey()
-  if (!key) return undefined
+  if (!key) return []
   const now = new Date()
   const from = now.toISOString().slice(0, 10)
   const tomorrow = new Date(now.getTime() + 86400000).toISOString().slice(0, 10)
@@ -163,26 +166,46 @@ async function actualTodayUsage(): Promise<Usage | undefined> {
     `https://api.surplusintelligence.ai/v1/buyer/usage/export?format=csv&from=${from}&to=${tomorrow}`,
     { headers: { Authorization: `Bearer ${key}`, "Accept-Encoding": "identity" } },
   )
-  if (!response.ok) return undefined
+  if (!response.ok) return []
   const lines = (await response.text()).trim().split(/\r?\n/)
-  if (lines.length < 2) return { cost: 0, tokens: 0, avgPer1M: 0 }
+  if (lines.length < 2) return []
   const header = csvFields(lines[0])
-  const costIndex = header.indexOf("buyer_cost_usd") >= 0 ? header.indexOf("buyer_cost_usd") : header.indexOf("cost_usd")
-  const directIndex = header.indexOf("direct_cost_usd")
-  const inIndex = header.indexOf("input_tokens")
-  const outIndex = header.indexOf("output_tokens")
-  if (costIndex < 0) return undefined
+  const iAt = header.indexOf("created_at")
+  const iModel = header.indexOf("model")
+  const iIn = header.indexOf("input_tokens")
+  const iOut = header.indexOf("output_tokens")
+  const iCost = header.indexOf("buyer_cost_usd") >= 0 ? header.indexOf("buyer_cost_usd") : header.indexOf("cost_usd")
+  const iDirect = header.indexOf("direct_cost_usd")
+  if (iCost < 0) return []
+  const rows: SettledRow[] = []
+  for (const line of lines.slice(1)) {
+    const f = csvFields(line)
+    rows.push({
+      at: iAt >= 0 ? +new Date(f[iAt]) : 0,
+      model: iModel >= 0 ? f[iModel] ?? "" : "",
+      inT: iIn >= 0 ? Number(f[iIn]) || 0 : 0,
+      outT: iOut >= 0 ? Number(f[iOut]) || 0 : 0,
+      cost: Number(f[iCost]) || 0,
+      direct: iDirect >= 0 ? Number(f[iDirect]) || 0 : 0,
+    })
+  }
+  return rows
+}
+
+async function actualTodayUsage(rows?: SettledRow[]): Promise<Usage | undefined> {
+  if (!rows) rows = await fetchSettledRows()
+  if (!rows.length) return undefined
   let cost = 0
   let direct = 0
   let tokens = 0
   let inTokens = 0
   let outTokens = 0
-  for (const line of lines.slice(1)) {
-    const fields = csvFields(line)
-    cost += Number(fields[costIndex]) || 0
-    if (directIndex >= 0) direct += Number(fields[directIndex]) || 0
-    if (inIndex >= 0) { const v = Number(fields[inIndex]) || 0; tokens += v; inTokens += v }
-    if (outIndex >= 0) { const v = Number(fields[outIndex]) || 0; tokens += v; outTokens += v }
+  for (const r of rows) {
+    cost += r.cost
+    direct += r.direct
+    tokens += r.inT + r.outT
+    inTokens += r.inT
+    outTokens += r.outT
   }
   return {
     cost,
@@ -669,6 +692,128 @@ function readModelsCache() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Rate calibration from settled usage
+//
+// Surplus's chat-completions response does NOT reliably include cost (only
+// some BYOK sellers return `cost_details`), so the only ground truth for what a
+// session actually cost is the settled per-request records
+// (/v1/buyer/usage/export). opencode already stores every assistant message's
+// token breakdown (fresh input, cache read, output, reasoning), so we match
+// those messages to settled rows by model + timestamp + tokens, then fit the
+// REAL per-token rates (fresh in / cache read / output). Session cost = that
+// session's tokens x the calibrated rates. Pairs + fitted rates persist in
+// surplus-rates.json and accumulate across sessions.
+// ---------------------------------------------------------------------------
+
+type CalibPair = { fresh: number; cache: number; out: number; cost: number; at: number }
+type CalibRates = { fresh: number; cache: number; out: number }
+type CalibRatesEntry = CalibRates & { at: number; n: number; mape: number }
+type CalibStore = { rates: Record<string, CalibRatesEntry>; pairs: Record<string, CalibPair[]> }
+
+function ratesPath() {
+  return `${process.env.XDG_DATA_HOME ?? `${homedir()}/.local/share`}/opencode/surplus-rates.json`
+}
+
+let calibStore: CalibStore | undefined
+let calibStoreAt = 0
+function readCalibStore(): CalibStore {
+  const now = Date.now()
+  if (calibStore && now - calibStoreAt < 2000) return calibStore
+  calibStoreAt = now
+  try {
+    calibStore = JSON.parse(readFileSync(ratesPath(), "utf8"))
+  } catch {
+    calibStore = { rates: {}, pairs: {} }
+  }
+  return calibStore ?? { rates: {}, pairs: {} }
+}
+
+function writeCalibStore(store: CalibStore) {
+  calibStore = store
+  try {
+    writeFileSync(ratesPath(), JSON.stringify(store, null, 2) + "\n")
+  } catch {}
+}
+
+// Least-squares fit of cost = fresh*fresh + cache*cache + out*out (per token),
+// returned as $/1M. Returns undefined until enough distinct pairs exist.
+function fitRates(pairs: CalibPair[]): CalibRates | undefined {
+  const n = pairs.length
+  if (n < 5) return undefined
+  const k = 3
+  const M = Array.from({ length: k }, () => Array(k + 1).fill(0))
+  for (const p of pairs) {
+    const A = [p.fresh, p.cache, p.out]
+    for (let j = 0; j < k; j++) {
+      M[j][k] += A[j] * p.cost
+      for (let l = 0; l < k; l++) M[j][l] += A[j] * A[l]
+    }
+  }
+  for (let i = 0; i < k; i++) {
+    let piv = i
+    for (let j = i + 1; j < k; j++) if (Math.abs(M[j][i]) > Math.abs(M[piv][i])) piv = j
+    const tmp = M[i]; M[i] = M[piv]; M[piv] = tmp
+    for (let j = i + 1; j < k; j++) {
+      const f = M[j][i] / M[i][i]
+      for (let l = i; l <= k; l++) M[j][l] -= f * M[i][l]
+    }
+  }
+  const x = Array(k).fill(0)
+  for (let i = k - 1; i >= 0; i--) {
+    x[i] = M[i][k]
+    for (let j = i + 1; j < k; j++) x[i] -= M[i][j] * x[j]
+    x[i] /= M[i][i]
+  }
+  if (!x.every((v) => Number.isFinite(v) && v >= 0)) return undefined
+  return { fresh: x[0] * 1e6, cache: x[1] * 1e6, out: x[2] * 1e6 }
+}
+
+// Match this session's assistant messages to settled rows and refit rates.
+async function calibrateRates(api: TuiApi, sessionID: string, settled: SettledRow[]) {
+  const store = readCalibStore()
+  let changed = false
+  for (const message of api.state.session.messages(sessionID)) {
+    if (message.role !== "assistant") continue
+    const t = message.tokens
+    if (!t) continue
+    const modelID = normalizeModelID(message.modelID)
+    if (!modelID) continue
+    const at = message.time?.completed ?? message.time?.created ?? 0
+    if (!at) continue
+    const fresh = t.input || 0
+    const cache = t.cache?.read || 0
+    const out = (t.output || 0) + (t.reasoning || 0)
+    const pairs = store.pairs[modelID] ?? []
+    if (pairs.some((p) => p.at === at && p.fresh === fresh && p.out === out)) continue
+    const cand = settled.filter((s) => s.model === modelID && Math.abs(s.at - at) <= 120000)
+    if (!cand.length) continue
+    let best: SettledRow | undefined
+    let bd = Infinity
+    for (const s of cand) {
+      const d = Math.abs(s.inT - (fresh + cache)) + Math.abs(s.outT - out)
+      if (d < bd) { bd = d; best = s }
+    }
+    if (!best || bd >= Math.max(50, (fresh + cache) * 0.3)) continue
+    store.pairs[modelID] = [...pairs, { fresh, cache, out, cost: best.cost, at }].slice(-600)
+    changed = true
+  }
+  if (!changed) return
+  for (const [modelID, pairs] of Object.entries(store.pairs)) {
+    const rates = fitRates(pairs)
+    if (!rates) continue
+    let ae = 0
+    let tot = 0
+    for (const p of pairs) {
+      const e = (p.fresh * rates.fresh + p.cache * rates.cache + p.out * rates.out) / 1e6
+      ae += Math.abs(e - p.cost)
+      tot += p.cost
+    }
+    store.rates[modelID] = { ...rates, at: Date.now(), n: pairs.length, mape: tot > 0 ? (ae / tot) * 100 : 0 }
+  }
+  writeCalibStore(store)
+}
+
 // A model id may come back prefixed with its provider ("surplus/glm-5.3-flash");
 // strip the prefix so TUI, server, tools, and the overrides store agree.
 function normalizeModelID(id: string): string {
@@ -691,6 +836,32 @@ function activeModel(api: TuiApi): { sessionID: string; model: string; providerI
 }
 
 function sessionUsage(api: TuiApi, sessionID: string): Usage {
+  const messages = api.state.session.messages(sessionID)
+  // Calibrated rates reflect what Surplus actually settled per token (fit from
+  // opencode's message token breakdowns against the settled usage CSV), so a
+  // session cost computed from them is far closer to reality than opencode's
+  // pricing-cache estimate. Fall back to opencode's own session totals until a
+  // model has enough matched pairs to calibrate (rates need >=5 pairs).
+  const lastAssist = [...messages].reverse().find((m) => m.role === "assistant")
+  const modelID = lastAssist ? normalizeModelID(lastAssist.modelID) : undefined
+  const rates = modelID ? readCalibStore().rates[modelID] : undefined
+  if (rates) {
+    let cost = 0
+    let tokens = 0
+    let cacheRead = 0
+    let input = 0
+    for (const message of messages) {
+      if (message.role !== "assistant") continue
+      const t = message.tokens
+      cost +=
+        ((t.input || 0) * rates.fresh + (t.cache?.read || 0) * rates.cache + ((t.output || 0) + (t.reasoning || 0)) * rates.out) /
+        1e6
+      tokens += (t.input || 0) + (t.output || 0) + (t.reasoning || 0) + (t.cache?.read || 0) + (t.cache?.write || 0)
+      cacheRead += t.cache?.read || 0
+      input += t.input || 0
+    }
+    return { cost, tokens, avgPer1M: tokens > 0 ? (cost / tokens) * 1e6 : 0, cacheRead, input }
+  }
   const session = api.state.session.get(sessionID)
   const t = session?.tokens
   if (t) {
@@ -705,7 +876,7 @@ function sessionUsage(api: TuiApi, sessionID: string): Usage {
   let tokens = 0
   let cacheRead = 0
   let input = 0
-  for (const message of api.state.session.messages(sessionID)) {
+  for (const message of messages) {
     if (message.role !== "assistant") continue
     cost += message.cost ?? 0
     input += message.tokens.input
@@ -1147,13 +1318,17 @@ const tui: TuiPlugin = async (api, options) => {
     if (spend.loading) return
     spend.loading = true
     try {
-      const usage = await actualTodayUsage()
+      const rows = await fetchSettledRows()
+      const usage = rows.length ? await actualTodayUsage(rows) : undefined
       spend.today = usage?.cost
       spend.todayTokens = usage?.tokens
       spend.todayAvgUsd = usage?.avgPer1M
       spend.todayDiscountPct = usage?.discountPct
       spend.todayIn = usage?.in
       spend.todayOut = usage?.out
+      const route = api.route.current
+      const sessionID = route.name === "session" ? (route.params as { sessionID?: string })?.sessionID : undefined
+      if (sessionID && rows.length) await calibrateRates(api, sessionID, rows)
     } catch {}
     spend.loading = false
     bump()
