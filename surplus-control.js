@@ -597,6 +597,32 @@ export const SurplusControlPlugin = async ({ client }) => {
         }
       }
 
+      // ---- Apply calibrated rates ----------------------------------------
+      // The TUI sidebar fits the REAL per-token rates (fresh input / cache read
+      // / output) from settled usage into surplus-rates.json. opencode computes
+      // every message's cost from the model's `cost` config at request time, so
+      // overriding it here makes opencode's own session.cost — and therefore
+      // the native TUI "spent" displays (Context panel, prompt bar) — reflect
+      // what Surplus actually settles instead of the (undercounted) market list
+      // prices. Applied AFTER the pricing-cache merge so it always wins.
+      let calib
+      try {
+        calib = JSON.parse(
+          readFileSync(`${process.env.XDG_DATA_HOME ?? `${homedir()}/.local/share`}/opencode/surplus-rates.json`, "utf8")
+        )
+      } catch {}
+      if (calib?.rates) {
+        for (const [mid, r] of Object.entries(calib.rates)) {
+          if (typeof r?.fresh !== "number" || typeof r?.cache !== "number" || typeof r?.out !== "number") continue
+          const cost = { input: r.fresh, output: r.out, cache_read: r.cache }
+          for (const [pid, provider] of Object.entries(cfg.provider ?? {})) {
+            if (!pid.startsWith("surplus")) continue
+            const model = provider.models?.[mid]
+            if (model) model.cost = { ...(model.cost ?? {}), ...cost }
+          }
+        }
+      }
+
       // ---- Model discovery ----------------------------------------------
       // Phase 2 (async, background): refresh the catalog + cache for next boot.
       ;(async () => {

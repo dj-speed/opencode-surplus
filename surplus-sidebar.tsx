@@ -103,9 +103,6 @@ type SpendState = {
   todayDiscountPct?: number
   todayIn?: number
   todayOut?: number
-  sessionCost?: number
-  sessionTokens?: number
-  sessionAvgUsd?: number
   loading: boolean
   offers: Offer[]
   model?: string
@@ -221,6 +218,15 @@ async function actualTodayUsage(rows?: SettledRow[]): Promise<Usage | undefined>
 function fmtTokens(n: number | undefined): string {
   if (n === undefined || !Number.isFinite(n)) return "--"
   if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`
+  return `${Math.round(n)}`
+}
+
+// One decimal place on the magnitude so the session row stays at offer width.
+function fmtTokensCompact(n: number | undefined): string {
+  if (n === undefined || !Number.isFinite(n)) return "--"
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`
   return `${Math.round(n)}`
 }
@@ -420,10 +426,16 @@ function SpendDisplay(props: { api: Parameters<TuiPlugin>[0]; sessionID: string;
     }
     if (pinRef) { pinRef.content = surplus ? shortPin(props.spend.pin) : ""; pinRef.fg = theme.textMuted }
     const session = sessionUsage(props.api, props.sessionID)
-    props.spend.sessionCost = session.cost
-    props.spend.sessionTokens = session.tokens
-    props.spend.sessionAvgUsd = session.avgPer1M
-    if (sessRef) { sessRef.content = session.tokens > 0 ? `$${session.cost.toFixed(4)} · avg $${session.avgPer1M.toFixed(3)}/1M · ${fmtTokens(session.tokens)} tok` : ""; sessRef.fg = theme.accent }
+    if (sessRef) {
+      // Session summary in the same style as the offers above it: discount off
+      // (settled cost vs settled direct cost), avg $/1M, and total tokens — no
+      // $ amount, which the native Context panel shows. Sized to fit the widest
+      // offer row (e.g. "$0.00413/1M · OpenRouter").
+      sessRef.content = session.tokens > 0
+        ? `${session.discountPct !== undefined ? session.discountPct.toFixed(1) : "--"}% off · $${session.avgPer1M.toFixed(5)}/1M · ${fmtTokensCompact(session.tokens)} tok`
+        : ""
+      sessRef.fg = theme.accent
+    }
     props.api.renderer.requestRender()
   }
   const unsubscribe = props.subscribe(sync)
@@ -706,9 +718,9 @@ function readModelsCache() {
 // surplus-rates.json and accumulate across sessions.
 // ---------------------------------------------------------------------------
 
-type CalibPair = { fresh: number; cache: number; out: number; cost: number; at: number }
+type CalibPair = { fresh: number; cache: number; out: number; cost: number; direct: number; at: number }
 type CalibRates = { fresh: number; cache: number; out: number }
-type CalibRatesEntry = CalibRates & { at: number; n: number; mape: number }
+type CalibRatesEntry = CalibRates & { direct: CalibRates; at: number; n: number; mape: number }
 type CalibStore = { rates: Record<string, CalibRatesEntry>; pairs: Record<string, CalibPair[]> }
 
 function ratesPath() {
@@ -737,16 +749,20 @@ function writeCalibStore(store: CalibStore) {
 }
 
 // Least-squares fit of cost = fresh*fresh + cache*cache + out*out (per token),
-// returned as $/1M. Returns undefined until enough distinct pairs exist.
-function fitRates(pairs: CalibPair[]): CalibRates | undefined {
+// returned as $/1M. `field` selects the y vector: "cost" (buyer) or "direct"
+// (the settled list-price cost), so the same pairs calibrate both the real
+// rates and the direct rates needed for a session discount. Returns undefined
+// until enough distinct pairs exist.
+function fitRates(pairs: CalibPair[], field: "cost" | "direct"): CalibRates | undefined {
   const n = pairs.length
   if (n < 5) return undefined
   const k = 3
   const M = Array.from({ length: k }, () => Array(k + 1).fill(0))
   for (const p of pairs) {
     const A = [p.fresh, p.cache, p.out]
+    const y = p[field]
     for (let j = 0; j < k; j++) {
-      M[j][k] += A[j] * p.cost
+      M[j][k] += A[j] * y
       for (let l = 0; l < k; l++) M[j][l] += A[j] * A[l]
     }
   }
@@ -785,7 +801,9 @@ async function calibrateRates(api: TuiApi, sessionID: string, settled: SettledRo
     const cache = t.cache?.read || 0
     const out = (t.output || 0) + (t.reasoning || 0)
     const pairs = store.pairs[modelID] ?? []
-    if (pairs.some((p) => p.at === at && p.fresh === fresh && p.out === out)) continue
+    // Skip pairs we've already matched that carry both costs; legacy pairs
+    // without `direct` are re-matched so they get one.
+    if (pairs.some((p) => p.at === at && p.fresh === fresh && p.out === out && typeof p.direct === "number")) continue
     const cand = settled.filter((s) => s.model === modelID && Math.abs(s.at - at) <= 120000)
     if (!cand.length) continue
     let best: SettledRow | undefined
@@ -795,13 +813,14 @@ async function calibrateRates(api: TuiApi, sessionID: string, settled: SettledRo
       if (d < bd) { bd = d; best = s }
     }
     if (!best || bd >= Math.max(50, (fresh + cache) * 0.3)) continue
-    store.pairs[modelID] = [...pairs, { fresh, cache, out, cost: best.cost, at }].slice(-600)
+    store.pairs[modelID] = [...pairs, { fresh, cache, out, cost: best.cost, direct: best.direct, at }].slice(-600)
     changed = true
   }
   if (!changed) return
   for (const [modelID, pairs] of Object.entries(store.pairs)) {
-    const rates = fitRates(pairs)
-    if (!rates) continue
+    const rates = fitRates(pairs, "cost")
+    const direct = fitRates(pairs, "direct")
+    if (!rates || !direct) continue
     let ae = 0
     let tot = 0
     for (const p of pairs) {
@@ -809,7 +828,7 @@ async function calibrateRates(api: TuiApi, sessionID: string, settled: SettledRo
       ae += Math.abs(e - p.cost)
       tot += p.cost
     }
-    store.rates[modelID] = { ...rates, at: Date.now(), n: pairs.length, mape: tot > 0 ? (ae / tot) * 100 : 0 }
+    store.rates[modelID] = { ...rates, direct, at: Date.now(), n: pairs.length, mape: tot > 0 ? (ae / tot) * 100 : 0 }
   }
   writeCalibStore(store)
 }
@@ -847,20 +866,33 @@ function sessionUsage(api: TuiApi, sessionID: string): Usage {
   const rates = modelID ? readCalibStore().rates[modelID] : undefined
   if (rates) {
     let cost = 0
+    let direct = 0
     let tokens = 0
     let cacheRead = 0
     let input = 0
     for (const message of messages) {
       if (message.role !== "assistant") continue
       const t = message.tokens
-      cost +=
-        ((t.input || 0) * rates.fresh + (t.cache?.read || 0) * rates.cache + ((t.output || 0) + (t.reasoning || 0)) * rates.out) /
-        1e6
-      tokens += (t.input || 0) + (t.output || 0) + (t.reasoning || 0) + (t.cache?.read || 0) + (t.cache?.write || 0)
-      cacheRead += t.cache?.read || 0
-      input += t.input || 0
+      const fresh = t.input || 0
+      const cache = t.cache?.read || 0
+      const out = (t.output || 0) + (t.reasoning || 0)
+      cost += (fresh * rates.fresh + cache * rates.cache + out * rates.out) / 1e6
+      if (rates.direct) {
+        direct += (fresh * rates.direct.fresh + cache * rates.direct.cache + out * rates.direct.out) / 1e6
+      }
+      tokens += fresh + (t.output || 0) + (t.reasoning || 0) + cache + (t.cache?.write || 0)
+      cacheRead += cache
+      input += fresh
     }
-    return { cost, tokens, avgPer1M: tokens > 0 ? (cost / tokens) * 1e6 : 0, cacheRead, input }
+    return {
+      cost,
+      tokens,
+      avgPer1M: tokens > 0 ? (cost / tokens) * 1e6 : 0,
+      direct,
+      discountPct: cost > 0 && direct > 0 ? Math.round((1 - cost / direct) * 1000) / 10 : undefined,
+      cacheRead,
+      input,
+    }
   }
   const session = api.state.session.get(sessionID)
   const t = session?.tokens
