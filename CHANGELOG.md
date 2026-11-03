@@ -3,6 +3,26 @@
 All notable changes to **opencode-surplus** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.0.0] - 2026-11-03
+
+This release moves the plugin to OpenCode 2 (tested on 2.2.5). The old 1.x plugin doesn't run on OpenCode 2, so if you're still on 1.x, stay on `v1.1.0`.
+
+### Changed
+
+The two old plugin files are now one folder, `surplus/`. OpenCode finds it on its own in `~/.config/opencode/plugins/surplus/`, so you no longer need an entry in `tui.json` or `cli.json`.
+
+Your API key now comes from OpenCode itself (set it with `/connect`) instead of being read from `auth.json`. In OpenCode 2 only the server side of a plugin can see credentials, so all calls to Surplus happen there and the sidebar asks the server for what it needs.
+
+Discount floors no longer need the little local proxy. The plugin points each request at the right Surplus address directly. A new floor still kicks in on your next message. Pins and the "floor not met" pop-up work the same as before, just wired up differently under the hood.
+
+All Surplus models now appear under the one `surplus-intelligence` provider, with their real context limits, tool support and prices. The separate `surplus-70`, `surplus-80`, `surplus-90` and `surplus-95` providers are gone. Use `/surplus-tier` to set a floor instead.
+
+Your pins, floors and settings are stored by OpenCode now, not in `surplus-control.json`, `surplus-rates.json` and `surplus-pricing.json`. They don't carry over, so set them again after upgrading.
+
+`sync-models.mjs` no longer needs `--write-config` or `--pricing`, because the plugin handles both itself. `--query` reads your key from `SURPLUS_API_KEY`.
+
+`/surplus-tui` now hides or shows the meter and sidebar until you restart, rather than turning the plugin off, because OpenCode 2 doesn't let a plugin switch itself off.
+
 ## [v1.1.0] - 2026-08-28
 
 ### Fixed

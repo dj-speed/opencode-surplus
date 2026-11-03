@@ -1,85 +1,69 @@
 #!/usr/bin/env bash
 #
-# opencode-surplus installer
-# --------------------------
-# Installs both opencode plugins into your global config:
-#   1. surplus-sidebar.tsx  -> ~/.config/opencode/surplus-sidebar.tsx
-#      (TUI plugin: sidebar status, TPS meter, /surplus-* commands)
-#   2. surplus-control.js   -> ~/.config/opencode/plugins/surplus-control.js
-#      (server plugin: surplus_* agent tools, routing pins)
+# opencode-surplus installer (OpenCode V2)
+# ----------------------------------------
+# Installs the plugin directory into your global OpenCode config:
+#   surplus/  -> ~/.config/opencode/plugins/surplus/
+#     index.js    server part: models, pricing, floors, pins, agent tools, RPC
+#     tui.tsx     TUI part: TPS meter, sidebar blocks, /surplus-* commands
+#     rpc.js      RPC contract shared by both parts
+#     catalog.js  catalog discovery + cache (also used by sync-models.mjs)
 #
-# It also adds surplus-sidebar.tsx to ~/.config/opencode/tui.json so opencode
-# loads it at startup. Existing tui.json is backed up first.
+# OpenCode V2 discovers plugin directories under ~/.config/opencode/plugins/
+# automatically; no config entry is needed. Changes apply without a restart.
 #
-# Usage:
-#   ./install.sh          # normal install (this directory must contain the files)
+# The V1 single-file plugins (plugins/surplus-control.js, surplus-sidebar.tsx)
+# do not run in V2; if found, they are moved into a timestamped backup folder.
 #
-# After running, restart opencode. See README.md for configuration.
+# Usage:  ./install.sh
 
 set -euo pipefail
 
-# Directory this script lives in (works when downloaded standalone too).
 SRC="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+DEST="$CONFIG_DIR/plugins/surplus"
+FILES=(index.js tui.tsx rpc.js catalog.js)
 
-if [ ! -f "$SRC/surplus-sidebar.tsx" ]; then
-  echo "error: surplus-sidebar.tsx not found next to this script" >&2
-  exit 1
+for f in "${FILES[@]}"; do
+  if [ ! -f "$SRC/surplus/$f" ]; then
+    echo "error: surplus/$f not found next to this script" >&2
+    exit 1
+  fi
+done
+
+mkdir -p "$DEST"
+for f in "${FILES[@]}"; do
+  cp "$SRC/surplus/$f" "$DEST/$f"
+done
+echo "installed $DEST/ ($(IFS=,; echo "${FILES[*]}"))"
+
+# Move V1 leftovers out of the plugin search path.
+BACKUP=""
+for legacy in "$CONFIG_DIR/plugins/surplus-control.js" "$CONFIG_DIR/surplus-sidebar.tsx"; do
+  if [ -f "$legacy" ]; then
+    [ -n "$BACKUP" ] || { BACKUP="$CONFIG_DIR/surplus-v1-backup-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$BACKUP"; }
+    mv "$legacy" "$BACKUP/"
+    echo "moved V1 file $(basename "$legacy") -> $BACKUP/"
+  fi
+done
+
+# Seed the model catalog so the picker is populated right away.
+if command -v node >/dev/null 2>&1; then
+  node "$SRC/sync-models.mjs" || echo "note: catalog seed failed; the plugin retries in the background"
 fi
 
-mkdir -p "$CONFIG_DIR/plugins"
+cat <<'EOF'
 
-# 1. Copy the TUI plugin.
-cp "$SRC/surplus-sidebar.tsx" "$CONFIG_DIR/surplus-sidebar.tsx"
-echo "installed $CONFIG_DIR/surplus-sidebar.tsx"
+Done. If you have not yet, add the provider to ~/.config/opencode/opencode.jsonc:
 
-# 2. Copy the server plugin.
-if [ -f "$SRC/surplus-control.js" ]; then
-  cp "$SRC/surplus-control.js" "$CONFIG_DIR/plugins/surplus-control.js"
-  echo "installed $CONFIG_DIR/plugins/surplus-control.js"
-else
-  echo "note: surplus-control.js not found; skipping server plugin"
-fi
+  "providers": {
+    "surplus-intelligence": {
+      "name": "Surplus Intelligence",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "https://api.surplusintelligence.ai/v1" }
+    }
+  }
 
-# 3. Copy the optional model-sync script (manual model discovery).
-if [ -f "$SRC/sync-models.mjs" ]; then
-  cp "$SRC/sync-models.mjs" "$CONFIG_DIR/sync-models.mjs"
-  echo "installed $CONFIG_DIR/sync-models.mjs"
-else
-  echo "note: sync-models.mjs not found; skipping"
-fi
-
-# 4. Wire the TUI plugin into tui.json (back it up first).
-TUI_JSON="$CONFIG_DIR/tui.json"
-if [ -f "$TUI_JSON" ]; then
-  cp "$TUI_JSON" "$TUI_JSON.bak-$(date +%Y%m%d-%H%M%S)"
-fi
-
-if ! grep -q "surplus-sidebar.tsx" "$TUI_JSON" 2>/dev/null; then
-  # Keep any existing keys; add the plugin entry if absent.
-  python3 - "$TUI_JSON" <<'PY'
-import json, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    data = {}
-plugins = data.get("plugin")
-if not isinstance(plugins, list):
-    plugins = []
-if "./surplus-sidebar.tsx" not in plugins:
-    plugins.append("./surplus-sidebar.tsx")
-data["plugin"] = plugins
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-PY
-  echo "added surplus-sidebar.tsx to $TUI_JSON"
-else
-  echo "$TUI_JSON already references surplus-sidebar.tsx; leaving as-is"
-fi
-
-echo
-echo "Done. Restart opencode to pick up the plugins."
-echo "See README.md for the provider/auth setup and the /surplus-* commands."
+then connect your API key with /connect (provider "surplus-intelligence").
+See README.md for the /surplus-* commands and options.
+EOF
